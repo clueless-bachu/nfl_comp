@@ -1,0 +1,10 @@
+work/
+logs/
+model_checkpoints/
+.ipynb_checkpoints/
+.vscode/
+test/
+train/
+tensorboard/
+__pycache__
+*.csv

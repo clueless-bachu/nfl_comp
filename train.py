@@ -26,13 +26,13 @@ from tqdm import tqdm
 CFG = {
     'seed': 42,
     'test_size': 1000,
-    'lr': 1e-4,
+    'lr': 1e-3,
     'num_workers': 8,  # 0 means do not use multiprocessing
     'batch_size': 64,
-    'iterations': 25000,
-    'val_wait': 200,
+    'iterations': 25000*10,
+    'val_wait': 200*10,
     'saver_mode': 'all',
-    'es_patience': 50,
+    'es_patience': 100,
     'rop_factor': 0.9,
     'rop_patience': 700,
     'run_name': 'baseline_3',
@@ -438,7 +438,7 @@ class Model(nn.Module):
     def __init__(self):
         super(Model, self).__init__()
         self.backbone = timm.create_model(
-            'resnet18', pretrained=False, num_classes=250, in_chans=26)
+            'resnet50', pretrained=False, num_classes=250, in_chans=26)
         self.mlp = nn.Sequential(
             nn.Linear(77, 128),
             nn.LayerNorm(128),

@@ -23,7 +23,7 @@ from tqdm import tqdm
 CFG = {
     'seed': 42,
     'test_size': 1000,
-    'lr': 1e-4,
+    'lr': 1e-3,
     'num_workers': 8,  # 0 means do not use multiprocessing
     'batch_size': 32,
     'num_epochs': 10,

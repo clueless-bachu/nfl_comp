@@ -22,17 +22,16 @@ from tqdm import tqdm
 
 CFG = {
     'seed': 42,
-    'test_size': 1000,
     'lr': 1e-3,
+    'weight_decay': 1e-6,
     'num_workers': 8,  # 0 means do not use multiprocessing
     'batch_size': 32,
     'num_epochs': 10,
-    'val_wait': 125,
     'saver_mode': 'all',
     'es_patience': 6,
     'rop_factor': 0.9,
-    'rop_patience': 50000,
-    'run_name': 'resnet50_fullforce',
+    'rop_patience': 20000,
+    'run_name': 'resnet50_v2',
     'log_level': logging.INFO,
 }
 
@@ -81,7 +80,120 @@ categorical_data_for_fitting = [
 ]
 
 
-class MyDataset(Dataset):
+class ValDataset(Dataset):
+    def __init__(self, df, aug, one_hot_transform, feature_cols=['rel_pos_x',
+                                                                 'rel_pos_y', 'rel_pos_mag', 'rel_pos_ori', 'rel_speed_x', 'rel_speed_y',
+                                                                 'rel_speed_mag', 'rel_speed_ori', 'rel_acceleration_x',
+                                                                 'rel_acceleration_y', 'rel_acceleration_mag', 'rel_acceleration_ori',
+                                                                 'G_flug', 'orientation_1', 'orientation_2']):
+
+        self.df = df
+        self.features = feature_cols
+        self.aug = aug
+        self.one_hot_transform = one_hot_transform
+
+    def __len__(self):
+        return len(self.df)
+
+    def normalize_features(self, features):
+        """
+        normalizes the features of the players
+
+       'rel_pos_x',
+       'rel_pos_y', 'rel_pos_mag', 'rel_pos_ori', 'rel_speed_x', 'rel_speed_y',
+       'rel_speed_mag', 'rel_speed_ori', 'rel_acceleration_x',
+       'rel_acceleration_y', 'rel_acceleration_mag', 'rel_acceleration_ori',
+       'G_flug', 'orientation_1', 'orientation_2'
+        """
+        features /= 100
+        features[3] /= 3.6
+        features[7] /= 3.6
+        features[11] /= 3.6
+        features[13] /= 3.6
+        features[14] /= 3.6
+        return features
+
+    def __getitem__(self, idx):
+        window = 24
+        frames_to_skip = 4
+
+        row = self.df.iloc[idx]
+        mid_frame = row['frame']
+
+        label = float(row['contact'])
+        imgs = []
+        for view in ['Endzone', 'Sideline']:
+            video = row['game_play'] + f'_{view}.mp4'
+            frames = [mid_frame - window +
+                      i for i in range(0, 2*window+1, frames_to_skip)]
+
+            bbox_col = 'bbox_endzone' if view == 'Endzone' else 'bbox_sideline'
+            bboxes = row[bbox_col][::frames_to_skip].astype(np.int32)
+
+            if bboxes.sum() <= 0:
+                imgs += [np.zeros((256, 256), dtype=np.float32)]*len(frames)
+                continue
+
+            for i, frame in enumerate(frames):
+                img_new = np.zeros((256, 256), dtype=np.float32)
+                cx, cy = bboxes[i]
+                path = f'./work/train_frames/{video}_{frame:04d}.jpg'
+                if os.path.isfile(path):
+                    img_new = np.zeros((256, 256), dtype=np.float32)
+                    if view == 'Endzone':
+                        img = cv2.imread(path, 0)[
+                            cy-76:cy+180, cx-128:cx+128].copy()
+                        img_new[:img.shape[0], :img.shape[1]] = img
+                    else:
+                        img = cv2.imread(path, 0)[
+                            cy-128:cy+128, cx-128:cx+128].copy()
+                        img_new[:img.shape[0], :img.shape[1]] = img
+                imgs.append(img_new)
+
+        img = np.array(imgs).transpose(1, 2, 0)
+        img = self.aug(image=img)["image"]
+
+        features = np.array(row[self.features], dtype=np.float32)
+        features[np.isnan(features)] = 0
+
+        """
+        rel_pos_x                0
+        rel_pos_y                1
+        rel_pos_mag              2
+        rel_pos_ori              3
+        rel_speed_x              4
+        rel_speed_y              5
+        rel_speed_mag            6
+        rel_speed_ori            7
+        rel_acceleration_x       8
+        rel_acceleration_y       9
+        rel_acceleration_mag     10
+        rel_acceleration_ori     11 
+        """
+        if row['G_flug']:
+            features[6] = row['speed_1']
+            features[7] = row['direction_1']
+            features[10] = row['acceleration_1']
+            features[11] = row['direction_1']
+
+            features[4] = row['speed_1']*np.sin(row['direction_1']*np.pi/180)
+            features[5] = row['speed_1']*np.cos(row['direction_1']*np.pi/180)
+            features[8] = row['acceleration_1'] * \
+                np.sin(row['direction_1']*np.pi/180)
+            features[9] = row['acceleration_1'] * \
+                np.cos(row['direction_1']*np.pi/180)
+        features = self.normalize_features(features)
+
+        team_pos = np.array(
+            row[['team_1', 'position_1', 'team_2', 'position_2']].fillna('Ground'))
+        team_pos = self.one_hot_transform.transform(
+            [team_pos]
+        ).toarray()[0]
+
+        return img, torch.from_numpy(np.hstack((features, team_pos)).astype(np.float32)), torch.as_tensor(label)
+
+
+class TrainDataset(Dataset):
     def __init__(self, df, aug, one_hot_transform, feature_cols=['rel_pos_x',
                                                                  'rel_pos_y', 'rel_pos_mag', 'rel_pos_ori', 'rel_speed_x', 'rel_speed_y',
                                                                  'rel_speed_mag', 'rel_speed_ori', 'rel_acceleration_x',
@@ -273,11 +385,11 @@ class ModelSaver():
 
 class Validator():
     def __init__(self, test_df, aug, criterion, transform, verbose=True):
-        self.test_set = MyDataset(
+        self.test_set = ValDataset(
             test_df, aug=aug, one_hot_transform=transform)
         self.verbose = verbose
         self.test_loader = DataLoader(
-            self.test_set, batch_size=CFG['batch_size'], num_workers=CFG['num_workers'], shuffle=False, pin_memory=False, persistent_workers=bool(CFG['num_workers']))
+            self.test_set, batch_size=CFG['batch_size'], num_workers=CFG['num_workers'], shuffle=False, pin_memory=True, persistent_workers=bool(CFG['num_workers']))
         self.criterion = criterion
 
     def validate(self, model, iteration, logger, tb):
@@ -374,7 +486,13 @@ class Model(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.2),
         )
-        self.fc = nn.Linear(64+250, 1)
+        self.fc = nn.Sequential(
+            nn.Linear(64+250, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 1),
+        )
 
     def forward(self, img, feature):
         img = self.backbone(img)
@@ -414,21 +532,19 @@ def main():
     df['bbox_sideline'] = df['bbox_sideline'].apply(process_bbox)
     logger.info("Loaded Train dataset")
 
-    df_G1 = df.loc[(df['contact'] == 1) & (df['G_flug'] == True)]
-    df_G0 = df.loc[(df['contact'] == 0) & (df['G_flug'] == True)]
-    df_P1 = df.loc[(df['contact'] == 1) & (df['G_flug'] == False)]
-    df_P0 = df.loc[(df['contact'] == 0) & (df['G_flug'] == False)]
+    np.random.seed(CFG['seed'])
+    val_plays = np.random.choice(df['game_play'].unique(), size=2)
+    val_set = df.apply(lambda row: row[df['game_play'].isin(val_plays)])
+    train_set = df.apply(lambda row: row[~df['game_play'].isin(val_plays)])
 
-    random_state = 42
-
-    train_G1, test_G1 = train_test_split(
-        df_G1, test_size=CFG['test_size']//4, random_state=random_state)
-    train_G0, test_G0 = train_test_split(
-        df_G0, test_size=CFG['test_size']//4, random_state=random_state)
-    train_P1, test_P1 = train_test_split(
-        df_P1, test_size=CFG['test_size']//4, random_state=random_state)
-    train_P0, test_P0 = train_test_split(
-        df_P0, test_size=CFG['test_size']//4, random_state=random_state)
+    train_G1 = train_set.loc[(df['contact'] == 1) & (
+        train_set['G_flug'] == True)].reset_index()
+    train_G0 = train_set.loc[(df['contact'] == 0) & (
+        train_set['G_flug'] == True)].reset_index()
+    train_P1 = train_set.loc[(df['contact'] == 1) & (
+        train_set['G_flug'] == False)].reset_index()
+    train_P0 = train_set.loc[(df['contact'] == 0) & (
+        train_set['G_flug'] == False)].reset_index()
 
     logger.info("Split the dataset into train and val sets")
 
@@ -446,14 +562,20 @@ def main():
         ToTensorV2()
     ])
 
-    train_set = MyDataset([train_G1.reset_index(), train_P1.reset_index(), train_P0.reset_index(), train_G0.reset_index()],
+    train_set = TrainDataset([train_G1, train_P1, train_P0, train_G0],
                              aug=train_aug, one_hot_transform=one_hot)
 
     logger.info("Creating dataloader")
     train_loader = DataLoader(
-        train_set, batch_size=CFG['batch_size'], num_workers=CFG['num_workers'], shuffle=True, pin_memory=False, persistent_workers=bool(CFG['num_workers']))
+        train_set, batch_size=CFG['batch_size'], num_workers=CFG['num_workers'], shuffle=True, pin_memory=True, persistent_workers=bool(CFG['num_workers']))
 
     logger.info("Created the dataloader")
+    criterion = nn.BCELoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CFG['lr'], weight_decay=CFG['weight_decay'])
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 'min', factor=CFG['rop_factor'], patience=CFG['rop_patience'], verbose=True
+    )
+
     cl_args = {
         "EarlyStopping": {
             'patience': CFG['es_patience']
@@ -463,9 +585,9 @@ def main():
             'path_name': tb_name_path,
         },
         "Validator": {
-            "test_df": [test_G1.reset_index(), test_G0.reset_index(), test_P1.reset_index(), test_P0.reset_index()],
+            "test_df": [val_set],
             "aug": valid_aug,
-            "criterion": nn.BCELoss(),
+            "criterion": criterion,
             "transform": one_hot,
             "verbose": True
         },
@@ -477,13 +599,8 @@ def main():
     model = Model()
     model.to('cuda')
     logger.info(f"Model for this run:\n{model}")
-    criterion = nn.BCELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=CFG['lr'])
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 'min', factor=CFG['rop_factor'], patience=CFG['rop_patience'], verbose=True
-    )
-
     model.train()
+    scaler = torch.cuda.amp.GradScaler()
 
     for cur_epochs in range(CFG['num_epochs']):
         for cur_iter, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
@@ -500,12 +617,14 @@ def main():
             logger.debug(f'This is the features: {feats}')
 
             optimizer.zero_grad()
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                y_hat = model(imgs, feats)
+                loss = criterion(y_hat, y)
 
-            y_hat = model(imgs, feats)
-            loss = criterion(y_hat, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-            loss.backward()
-            optimizer.step()
             scheduler.step(loss)
 
             logger.debug("Updated weights")
@@ -514,7 +633,6 @@ def main():
             train_stats, train_mathew_corr, train_acc = get_stats(
                 loss, y, y_hat, logger=logger, cur_iter=cur_iter)
 
-            del imgs, feats, y
             logger.info(f'{train_stats}')
 
             tb.add_scalar("Train Loss", loss.item(), cur_iter)

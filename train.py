@@ -1,7 +1,6 @@
 from helper import *
 import logging
 from albumentations.pytorch import ToTensorV2
-from multiprocessing import Pool, set_start_method
 import albumentations as A
 import timm
 from datetime import datetime
@@ -19,23 +18,21 @@ import numpy as np
 import pandas as pd
 import random
 import cv2
-from math import ceil
 from tqdm import tqdm
-
 
 CFG = {
     'seed': 42,
     'test_size': 1000,
     'lr': 1e-3,
     'num_workers': 8,  # 0 means do not use multiprocessing
-    'batch_size': 64,
-    'iterations': 25000*10,
-    'val_wait': 200*10,
+    'batch_size': 32,
+    'num_epochs': 10,
+    'val_wait': 125,
     'saver_mode': 'all',
-    'es_patience': 100,
+    'es_patience': 6,
     'rop_factor': 0.9,
-    'rop_patience': 700,
-    'run_name': 'baseline_3',
+    'rop_patience': 50000,
+    'run_name': 'resnet50_fullforce',
     'log_level': logging.INFO,
 }
 
@@ -84,63 +81,20 @@ categorical_data_for_fitting = [
 ]
 
 
-def read_image(path, cx, cy, view, aug):
-    img_new = np.zeros((1, 256, 256), dtype=np.float32)
-    if os.path.isfile(path):
-        if view == 'Endzone':
-            img = cv2.imread(path, 0)[
-                cy-76:cy+180, cx-128:cx+128].copy()
-            img_new[0, :img.shape[0], :img.shape[1]] = img
-        else:
-            img = cv2.imread(path, 0)[
-                cy-128:cy+128, cx-128:cx+128].copy()
-            img_new[0, :img.shape[0], :img.shape[1]] = img
-
-    return aug(image=img_new.transpose(1, 2, 0))['image'][0]
-
-
 class MyDataset(Dataset):
-    def __init__(self, df1, df2, df3, df4, logger, aug, one_hot_transform, train=True, feature_cols=['rel_pos_x',
-                                                                                                     'rel_pos_y', 'rel_pos_mag', 'rel_pos_ori', 'rel_speed_x', 'rel_speed_y',
-                                                                                                     'rel_speed_mag', 'rel_speed_ori', 'rel_acceleration_x',
-                                                                                                     'rel_acceleration_y', 'rel_acceleration_mag', 'rel_acceleration_ori',
-                                                                                                     'G_flug', 'orientation_1', 'orientation_2']):
+    def __init__(self, df, aug, one_hot_transform, feature_cols=['rel_pos_x',
+                                                                 'rel_pos_y', 'rel_pos_mag', 'rel_pos_ori', 'rel_speed_x', 'rel_speed_y',
+                                                                 'rel_speed_mag', 'rel_speed_ori', 'rel_acceleration_x',
+                                                                 'rel_acceleration_y', 'rel_acceleration_mag', 'rel_acceleration_ori',
+                                                                 'G_flug', 'orientation_1', 'orientation_2']):
 
-        self.df1 = df1
-        self.df2 = df2
-        self.df3 = df3
-        self.df4 = df4
-        self.logger = logger
+        self.df = df
         self.features = feature_cols
         self.aug = aug
-        self.train = train
         self.one_hot_transform = one_hot_transform
 
     def __len__(self):
-        return max(len(self.df1), len(self.df2), len(self.df3), len(self.df4))//(CFG['batch_size']//4)
-
-    def get_rows(self, lnum, unum, df_num):
-        df_map = {
-            1: self.df1,
-            2: self.df2,
-            3: self.df3,
-            4: self.df4,
-        }
-        self.logger.debug(f"df{df_num} with lnum:{lnum}, unum:{unum}")
-        lnum = lnum % len(df_map[df_num])
-        unum = unum % len(df_map[df_num])
-        self.logger.debug(f"df{df_num} with lnum:{lnum}, unum:{unum}")
-
-        if lnum < unum:
-            self.logger.debug(f"return is {df_map[df_num][lnum:unum].shape}")
-            return df_map[df_num][lnum:unum]
-        else:
-            self.logger.debug(
-                f"return is {pd.concat([df_map[df_num][lnum:], df_map[df_num][:unum]]).shape}")
-            if self.train:
-                return pd.concat([df_map[df_num][lnum:], df_map[df_num][:unum]])
-            else:
-                return df_map[df_num][lnum:]
+        return max([len(df) for df in self.df])*4
 
     def normalize_features(self, features):
         """
@@ -164,58 +118,50 @@ class MyDataset(Dataset):
         window = 24
         frames_to_skip = 4
 
-        self.logger.debug(f"idx that is causing issue: {idx}")
+        df_num = idx % 4
+        index = (idx//4) % len(self.df[df_num])
 
-        row1 = self.get_rows(
-            idx*(CFG['batch_size']//4), (idx+1)*(CFG['batch_size']//4), 1).reset_index(drop=True)
-        row2 = self.get_rows(
-            idx*(CFG['batch_size']//4), (idx+1)*(CFG['batch_size']//4), 2).reset_index(drop=True)
-        row3 = self.get_rows(
-            idx*(CFG['batch_size']//4), (idx+1)*(CFG['batch_size']//4), 3).reset_index(drop=True)
-        row4 = self.get_rows(
-            idx*(CFG['batch_size']//4), (idx+1)*(CFG['batch_size']//4), 4).reset_index(drop=True)
-
-        row = pd.concat([row1, row2, row3, row4]).reset_index(drop=True)
-        self.logger.debug(f"row colums: {row.columns}")
-        self.logger.debug(f"Row shape:{row.shape}")
+        row = self.df[df_num].iloc[index]
         mid_frame = row['frame']
-        self.logger.debug(f"mid frames shape:{len(mid_frame)}")
-        label = np.array(row['contact']).astype(np.float32)
-        self.logger.debug(f"label:{len(label)}")
-        args = []
-        for i in range(len(row)):
-            for view in ['Endzone', 'Sideline']:
-                video = row.iloc[i]['game_play'] + f'_{view}.mp4'
-                cur_mid_frame = mid_frame.iloc[i]
-                frames = [cur_mid_frame - window +
-                          next_frame for next_frame in range(0, 2*window+1, frames_to_skip)]
-                bbox_col = 'bbox_endzone' if view == 'Endzone' else 'bbox_sideline'
-                self.logger.debug(
-                    f"bbox details:\n{row.iloc[i][bbox_col][::frames_to_skip]}")
-                bboxes = row.iloc[i][bbox_col][::frames_to_skip].astype(
-                    np.int32)
 
-                if bboxes.sum() <= 0:
-                    args += [('dummy', 0, 0, view, self.aug)]*len(frames)
-                    continue
+        label = float(row['contact'])
+        imgs = []
+        for view in ['Endzone', 'Sideline']:
+            video = row['game_play'] + f'_{view}.mp4'
+            frames = [mid_frame - window +
+                      i for i in range(0, 2*window+1, frames_to_skip)]
 
-                for frame_iter, frame in enumerate(frames):
-                    cx, cy = bboxes[frame_iter]
-                    path = f'./work/train_frames/{video}_{frame:04d}.jpg'
-                    args.append((path, cx, cy, view, self.aug))
+            bbox_col = 'bbox_endzone' if view == 'Endzone' else 'bbox_sideline'
+            bboxes = row[bbox_col][::frames_to_skip].astype(np.int32)
 
-        self.logger.debug(f"sizeof args:{len(args)}")
-        with Pool(CFG['num_workers']) as pool:
-            imgs = list(pool.starmap(read_image, args))
-            pool.close()
-        
-        img = torch.stack(imgs).reshape(len(row), 26, 256, 256)
-        self.logger.debug(f"processed imgs:{img.shape}")
+            if bboxes.sum() <= 0:
+                imgs += [np.zeros((256, 256), dtype=np.float32)]*len(frames)
+                continue
+
+            for i, frame in enumerate(frames):
+                img_new = np.zeros((256, 256), dtype=np.float32)
+                cx, cy = bboxes[i]
+                path = f'./work/train_frames/{video}_{frame:04d}.jpg'
+                if os.path.isfile(path):
+                    img_new = np.zeros((256, 256), dtype=np.float32)
+                    if view == 'Endzone':
+                        img = cv2.imread(path, 0)[
+                            cy-76:cy+180, cx-128:cx+128].copy()
+                        img_new[:img.shape[0], :img.shape[1]] = img
+                    else:
+                        img = cv2.imread(path, 0)[
+                            cy-128:cy+128, cx-128:cx+128].copy()
+                        img_new[:img.shape[0], :img.shape[1]] = img
+                imgs.append(img_new)
+
+        img = np.array(imgs).transpose(1, 2, 0)
+        img = self.aug(image=img)["image"]
+
         features = np.array(row[self.features], dtype=np.float32)
         features[np.isnan(features)] = 0
 
         """
-        rel_pos_x                0fork
+        rel_pos_x                0
         rel_pos_y                1
         rel_pos_mag              2
         rel_pos_ori              3
@@ -228,29 +174,26 @@ class MyDataset(Dataset):
         rel_acceleration_mag     10
         rel_acceleration_ori     11 
         """
-        for i in range(len(row)):
-            if row.iloc[i]['G_flug']:
-                features[i, 6] = row.iloc[i]['speed_1']
-                features[i, 7] = row.iloc[i]['direction_1']
-                features[i, 10] = row.iloc[i]['acceleration_1']
-                features[i, 11] = row.iloc[i]['direction_1']
+        if row['G_flug']:
+            features[6] = row['speed_1']
+            features[7] = row['direction_1']
+            features[10] = row['acceleration_1']
+            features[11] = row['direction_1']
 
-                features[i, 4] = row.iloc[i]['speed_1'] * \
-                    np.sin(row.iloc[i]['direction_1']*np.pi/180)
-                features[i, 5] = row.iloc[i]['speed_1'] * \
-                    np.cos(row.iloc[i]['direction_1']*np.pi/180)
-                features[i, 8] = row.iloc[i]['acceleration_1'] * \
-                    np.sin(row.iloc[i]['direction_1']*np.pi/180)
-                features[i, 9] = row.iloc[i]['acceleration_1'] * \
-                    np.cos(row.iloc[i]['direction_1']*np.pi/180)
-
-            features[i, :] = self.normalize_features(features[i])
-        self.logger.debug(f"processed features:{features.shape}")
+            features[4] = row['speed_1']*np.sin(row['direction_1']*np.pi/180)
+            features[5] = row['speed_1']*np.cos(row['direction_1']*np.pi/180)
+            features[8] = row['acceleration_1'] * \
+                np.sin(row['direction_1']*np.pi/180)
+            features[9] = row['acceleration_1'] * \
+                np.cos(row['direction_1']*np.pi/180)
+        features = self.normalize_features(features)
 
         team_pos = np.array(
             row[['team_1', 'position_1', 'team_2', 'position_2']].fillna('Ground'))
-        team_pos = self.one_hot_transform.transform(team_pos).toarray()
-        # gc.collect()
+        team_pos = self.one_hot_transform.transform(
+            [team_pos]
+        ).toarray()[0]
+
         return img, torch.from_numpy(np.hstack((features, team_pos)).astype(np.float32)), torch.as_tensor(label)
 
 
@@ -329,24 +272,23 @@ class ModelSaver():
 
 
 class Validator():
-    def __init__(self, df1, df2, df3, df4, aug, logger, criterion, transform, verbose=True):
+    def __init__(self, test_df, aug, criterion, transform, verbose=True):
         self.test_set = MyDataset(
-            df1, df2, df3, df4, logger=logger, aug=aug, train=False, one_hot_transform=transform)
+            test_df, aug=aug, one_hot_transform=transform)
         self.verbose = verbose
-        self.counter = 0
+        self.test_loader = DataLoader(
+            self.test_set, batch_size=CFG['batch_size'], num_workers=CFG['num_workers'], shuffle=False, pin_memory=False, persistent_workers=bool(CFG['num_workers']))
         self.criterion = criterion
 
-    def validate(self, model, train_iteration, logger, tb):
+    def validate(self, model, iteration, logger, tb):
         y_hat = []
         y = []
         loss = 0
-        logger.debug("converting testloader to iter")
-        logger.debug("done converting testloader to iter")
         model.eval()
         with torch.no_grad():
-            for val_iteration in range(ceil(CFG['test_size']/CFG['batch_size'])):
+            for batch in self.test_loader:
+                imgs, features, labels = batch
 
-                imgs, features, labels = self.test_set[val_iteration]
                 imgs = imgs.to(0, non_blocking=True)
                 features = features.to(0, non_blocking=True)
                 labels = labels.to(0, non_blocking=True)
@@ -367,14 +309,15 @@ class Validator():
 
             loss = loss/CFG['batch_size']
 
-            stats, val_mathew_corr,  val_acc, _, _ = get_stats(
-                loss, y, y_hat, cur_iter=f"Val@{train_iteration}", logger=logger)
+            stats, val_mathew_corr,  val_acc = get_stats(
+                loss, y, y_hat, cur_iter=f"Val@{iteration}", logger=logger)
 
-            tb.add_scalar("Val Loss", loss, train_iteration)
+            tb.add_scalar("Val Loss", loss, iteration)
             tb.add_scalar("Val  Accuracy", val_acc,
-                          train_iteration)
+                          iteration)
             tb.add_scalar("Val Mathew Correlation",
-                          val_mathew_corr, train_iteration)
+                          val_mathew_corr, iteration)
+
             if self.verbose:
                 logger.info(f"{stats}")
 
@@ -390,7 +333,7 @@ class Callback():
     def callback(self, model, iteration, logger, tb):
         logger.info("Validating Data")
         metric = self.valer.validate(
-            model, train_iteration=iteration, logger=logger, tb=tb)
+            model, iteration=iteration, logger=logger, tb=tb)
         stop, best = self.es.stop(metric, logger=logger)
         if best:
             logger.info("New Best Model !!")
@@ -409,36 +352,18 @@ def get_stats(loss, y, y_pred, logger, cur_iter='val', thresh=0.5):
     y_hat = (y_pred > thresh)*1.0
     mathew_corr = matthews_corrcoef(y, y_hat)
     acc = accuracy_score(y, y_hat)
+    logger.debug(f"yhat--> {y_hat}")
+    logger.debug(f"y--> {y}")
 
-    size = len(y_hat)
-    classwise_mathew_corr = []
-    classwise_acc = []
-    for i in range(4):
-        y_cl = y[i*(size//4):(i+1)*(size//4)]
-        y_hat_cl = y_hat[i*(size//4):(i+1)*(size//4)]
-        logger.debug(f"{i}")
-        logger.debug(f"this is y_cl\n{y_cl}")
-        logger.debug(f"this is y_cl\n{y_hat_cl}")
-        logger.debug(f"cl mtcorr:{matthews_corrcoef(y_cl, y_hat_cl)}")
-        logger.debug(f"cl acc:{accuracy_score(y_cl, y_hat_cl)}")
-        classwise_mathew_corr.append(matthews_corrcoef(y_cl, y_hat_cl))
-        classwise_acc.append(accuracy_score(y_cl, y_hat_cl))
-
-    stats = f'Iteration: {cur_iter} || Loss: {loss:.5f} || mat_corr: {mathew_corr:.5f} || acc: {acc:.5f}'
-    stats += f""" 
-|| G1_mat_corr: {classwise_mathew_corr[0]:.5f} || G0_mat_corr: {classwise_mathew_corr[1]:.5f} || P1_mat_corr: {classwise_mathew_corr[2]:.5f} || P0_mat_corr: {classwise_mathew_corr[3]:.5f}"""
-    stats += f"""
-||G1_acc: {classwise_acc[0]:.5f} || G0_acc: {classwise_acc[1]:.5f} || P1_acc: {classwise_acc[2]:.5f} || P0_acc: {classwise_acc[3]:.5f} EOL
-    """
-
-    return stats.replace("\n", ""),  mathew_corr, acc, classwise_mathew_corr, classwise_acc
+    stats = f'Iteration: {cur_iter} || Loss: {loss:.5f} || mat_corr: {mathew_corr:.5f} || acc: {acc:.5f} || EOL'
+    return stats.replace("\n", ""),  mathew_corr, acc
 
 
 class Model(nn.Module):
     def __init__(self):
         super(Model, self).__init__()
         self.backbone = timm.create_model(
-            'resnet50', pretrained=False, num_classes=250, in_chans=26)
+            'resnet50', pretrained=True, num_classes=250, in_chans=26)
         self.mlp = nn.Sequential(
             nn.Linear(77, 128),
             nn.LayerNorm(128),
@@ -461,7 +386,6 @@ class Model(nn.Module):
 def main():
     tb_name_path = CFG['run_name'] + "_" + \
         str(datetime.now()).replace(" ", '-').replace(':', '-').split('.')[0]
-    set_start_method('fork')
 
     logger = logging.getLogger(__name__)
     logger.setLevel(CFG['log_level'])
@@ -522,10 +446,12 @@ def main():
         ToTensorV2()
     ])
 
-    train_set = MyDataset(train_G1.reset_index(drop=True), train_G0.reset_index(drop=True), train_P1.reset_index(drop=True), train_P0.reset_index(drop=True), logger=logger,
-                          aug=train_aug, one_hot_transform=one_hot)
+    train_set = MyDataset([train_G1.reset_index(), train_P1.reset_index(), train_P0.reset_index(), train_G0.reset_index()],
+                             aug=train_aug, one_hot_transform=one_hot)
 
     logger.info("Creating dataloader")
+    train_loader = DataLoader(
+        train_set, batch_size=CFG['batch_size'], num_workers=CFG['num_workers'], shuffle=True, pin_memory=False, persistent_workers=bool(CFG['num_workers']))
 
     logger.info("Created the dataloader")
     cl_args = {
@@ -537,11 +463,7 @@ def main():
             'path_name': tb_name_path,
         },
         "Validator": {
-            "df1": test_G1,
-            "df2": test_G0,
-            "df3": test_P1,
-            "df4": test_P0,
-            "logger": logger,
+            "test_df": [test_G1.reset_index(), test_G0.reset_index(), test_P1.reset_index(), test_P0.reset_index()],
             "aug": valid_aug,
             "criterion": nn.BCELoss(),
             "transform": one_hot,
@@ -552,8 +474,7 @@ def main():
     logger.info(f"Callback Arguments:\n{cl_args}")
     cl = Callback(cl_args)
 
-    # model = Model()
-    model = torch.load("./model_checkpoints/baseline_3_2023-02-06-08-19-29/best_model.pth")
+    model = Model()
     model.to('cuda')
     logger.info(f"Model for this run:\n{model}")
     criterion = nn.BCELoss()
@@ -562,72 +483,52 @@ def main():
         optimizer, 'min', factor=CFG['rop_factor'], patience=CFG['rop_patience'], verbose=True
     )
 
-    num_iters = CFG['iterations']
-    validate_wait = CFG['val_wait']
     model.train()
 
-    imgs, feats, labels = train_set[7348]
-    for cur_iter in tqdm(range(num_iters+1)):
-        logger.debug("Starting new iteration")
-        imgs, features, labels = train_set[cur_iter]
+    for cur_epochs in range(CFG['num_epochs']):
+        for cur_iter, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
+            logger.debug("Starting new iteration")
+            imgs1, features1, labels1 = batch
 
-        imgs = imgs.to(0, non_blocking=True)
-        y = labels.to(0, non_blocking=True)
-        feats = features.to(0, non_blocking=True)
+            imgs = imgs1.to(0, non_blocking=True)
+            feats = features1.to(0, non_blocking=True)
+            y = labels1.to(0, non_blocking=True)
 
-        logger.debug(f"imgs shape: {imgs.shape}")
-        logger.debug(f"features shape: {features}")
-        logger.debug(f"labels: {labels}")
+            logger.debug(f"imgs shape: {imgs.shape}")
+            logger.debug(f"{imgs}")
+            logger.debug(f'This is the labels: {labels1}')
+            logger.debug(f'This is the features: {feats}')
 
-        optimizer.zero_grad()
+            optimizer.zero_grad()
 
-        y_hat = model(imgs, feats)
-        loss = criterion(y_hat, y)
+            y_hat = model(imgs, feats)
+            loss = criterion(y_hat, y)
 
-        loss.backward()
-        optimizer.step()
-        scheduler.step(loss)
+            loss.backward()
+            optimizer.step()
+            scheduler.step(loss)
 
-        logger.debug("Updated weights")
-        y = y.cpu().detach().numpy()
-        y_hat = y_hat.cpu().detach().numpy()
-        train_stats, train_mathew_corr, train_acc, train_classwise_mathew_corr, train_classwise_acc = get_stats(
-            loss, y, y_hat, logger=logger, cur_iter=cur_iter)
+            logger.debug("Updated weights")
+            y = y.cpu().detach().numpy()
+            y_hat = y_hat.cpu().detach().numpy()
+            train_stats, train_mathew_corr, train_acc = get_stats(
+                loss, y, y_hat, logger=logger, cur_iter=cur_iter)
 
-        # del imgs, feats, y
-        logger.info(f'{train_stats}')
+            del imgs, feats, y
+            logger.info(f'{train_stats}')
 
-        tb.add_scalar("Train Loss", loss.item(), cur_iter)
-        tb.add_scalar("Train Accuracy", train_acc, cur_iter)
-        tb.add_scalar("Train Mathew Correlation",
-                      train_mathew_corr, cur_iter)
+            tb.add_scalar("Train Loss", loss.item(), cur_iter)
+            tb.add_scalar("Train Accuracy", train_acc, cur_iter)
+            tb.add_scalar("Train Mathew Correlation",
+                          train_mathew_corr, cur_iter)
 
-        tb.add_scalar("Train Mathew Correlation G1",
-                      train_classwise_mathew_corr[0], cur_iter)
-        tb.add_scalar("Train Mathew Correlation P1",
-                      train_classwise_mathew_corr[1], cur_iter)
-        tb.add_scalar("Train Mathew Correlation P0",
-                      train_classwise_mathew_corr[2], cur_iter)
-        tb.add_scalar("Train Mathew Correlation G0",
-                      train_classwise_mathew_corr[3], cur_iter)
+            logger.debug("Logged stats")
+            logger.debug("Moving to next iteration")
 
-        tb.add_scalar("Train Accuracy G1",
-                      train_classwise_acc[0], cur_iter)
-        tb.add_scalar("Train Accuracy P1",
-                      train_classwise_acc[1], cur_iter)
-        tb.add_scalar("Train Accuracy P0",
-                      train_classwise_acc[2], cur_iter)
-        tb.add_scalar("Train Accuracy G0",
-                      train_classwise_acc[3], cur_iter)
-
-        logger.debug("Logged stats")
-
-        if cur_iter % validate_wait == 0:
-            if cl.callback(model, cur_iter, logger=logger, tb=tb):
-                break
-            # Converting back to training model
-            model.train()
-        logger.debug("Moving to next iteration")
+        if cl.callback(model, cur_epochs, logger=logger, tb=tb):
+            break
+        # Converting back to training model
+        model.train()
 
     logger.info("Completed number of iterations")
     tb.close()

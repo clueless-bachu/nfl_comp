@@ -17,20 +17,19 @@ import pandas as pd
 import random
 import cv2
 from tqdm import tqdm
-import torcheck
 
 CFG = {
     'seed': 42,
-    'lr': 1e-5,
+    'lr': 1e-3,
     'weight_decay': 1e-6,
     'num_workers': 8,  # 0 means do not use multiprocessing
     'batch_size': 32,
-    'num_epochs': 10,
+    'num_epochs': 20,
     'saver_mode': 'all',
     'es_patience': 6,
-    'rop_factor': 0.5,
+    'rop_factor': 0.75,
     'rop_patience': 10000,
-    'run_name': 'resnet50_v3',
+    'run_name': 'resnext101_v1',
     'log_level': logging.INFO,
 }
 
@@ -474,27 +473,35 @@ class Model(nn.Module):
     def __init__(self):
         super(Model, self).__init__()
         self.backbone = timm.create_model(
-            'resnet50', pretrained=True, num_classes=250, in_chans=26)
+            'resnext101_64x4d', pretrained=True, num_classes=250, in_chans=26)
+        self.resblock = nn.Sequential(
+            nn.Linear(77, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 77),
+            nn.LayerNorm(77),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+        )
+
         self.mlp = nn.Sequential(
             nn.Linear(77, 128),
             nn.LayerNorm(128),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.LayerNorm(64),
-            nn.ReLU(),
-            nn.Dropout(0.2),
         )
         self.fc = nn.Sequential(
-            nn.Linear(64+250, 128),
-            nn.LayerNorm(128),
+            nn.Linear(128+250, 256),
+            nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(128, 1),
+            nn.Linear(256, 1),
         )
 
     def forward(self, img, feature):
         img = self.backbone(img)
+        feature = self.resblock(feature) + feature
         feature = self.mlp(feature)
         y = self.fc(torch.cat([img, feature], dim=1))
         return y.flatten()

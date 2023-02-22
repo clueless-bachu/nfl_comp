@@ -647,6 +647,7 @@ def main():
 
     for cur_epochs in range(CFG['num_epochs']):
         for cur_iter, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
+            tot_iter = cur_epochs*len(train_loader) + cur_iter
             logger.debug("Starting new iteration")
             imgs1, features1, labels1 = batch
 
@@ -681,10 +682,10 @@ def main():
 
             logger.info(f'{train_stats}')
 
-            tb.add_scalar("Train Loss", loss.item(), cur_iter)
-            tb.add_scalar("Train Accuracy", train_acc, cur_iter)
+            tb.add_scalar("Train Loss", loss.item(), tot_iter)
+            tb.add_scalar("Train Accuracy", train_acc, tot_iter)
             tb.add_scalar("Train Mathew Correlation",
-                          train_mathew_corr, cur_iter)
+                          train_mathew_corr, tot_iter)
 
             logger.debug("Logged stats")
             logger.debug("Moving to next iteration")
